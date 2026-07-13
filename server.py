@@ -83,9 +83,9 @@ SOURCES: dict[str, dict] = {
     },
     "csharp": {
         "name": "C#", "category": "programming_language",
-        "desc": "C# / .NET (Microsoft Learn)",
+        "desc": "C# / .NET (Microsoft Learn REST API)",
         "sites": ["learn.microsoft.com"],
-        "search_url": "https://learn.microsoft.com/en-us/dotnet/csharp/search/?search={q}",
+        "api": "mslearn",
     },
     "ruby": {
         "name": "Ruby", "category": "programming_language",
@@ -101,9 +101,12 @@ SOURCES: dict[str, dict] = {
     },
     "kotlin": {
         "name": "Kotlin", "category": "programming_language",
-        "desc": "Kotlin stdlib docs",
+        "desc": "Kotlin stdlib docs (Algolia DocSearch)",
         "sites": ["kotlinlang.org"],
-        "search_url": "https://kotlinlang.org/api/latest/jvm/stdlib/search.html?searchQuery={q}",
+        "api": "algolia",
+        "algolia_app_id": "7961PKYRXV",
+        "algolia_api_key": "1bfad5fdbae302b33d844ed1b43ec4d5",
+        "algolia_index": "prod_KOTLINLANG_WEBHELP",
     },
     "php": {
         "name": "PHP", "category": "programming_language",
@@ -158,21 +161,31 @@ SOURCES: dict[str, dict] = {
     # ── framework ──────────────────────────────────────────────────
     "react": {
         "name": "React", "category": "framework",
-        "desc": "React framework",
+        "desc": "React framework (Algolia DocSearch)",
         "sites": ["react.dev"],
-        "search_url": "https://react.dev/search?q={q}",
+        "api": "algolia",
+        "algolia_app_id": "1FCF9AYYAT",
+        "algolia_api_key": "1b7ad4e1c89e645e351e59d40544eda1",
+        "algolia_index": "beta-react",
     },
     "vue": {
         "name": "Vue.js", "category": "framework",
-        "desc": "Vue.js framework",
+        "desc": "Vue.js framework (Algolia DocSearch)",
         "sites": ["vuejs.org"],
-        "search_url": "https://vuejs.org/search.html?query={q}",
+        "api": "algolia",
+        "algolia_app_id": "ML0LEBN7FQ",
+        "algolia_api_key": "10e7a8b13e6aec4007343338ab134e05",
+        "algolia_index": "vuejs",
+        "algolia_facet": "version:v3",
     },
     "angular": {
         "name": "Angular", "category": "framework",
-        "desc": "Angular framework",
+        "desc": "Angular framework (Algolia DocSearch)",
         "sites": ["angular.dev"],
-        "search_url": "https://angular.dev/search?search={q}",
+        "api": "algolia",
+        "algolia_app_id": "L1XWT2UJ7F",
+        "algolia_api_key": "dfca7ed184db27927a512e5c6668b968",
+        "algolia_index": "angular_v17",
     },
     "svelte": {
         "name": "Svelte", "category": "framework",
@@ -592,6 +605,79 @@ async def _search_bing(
     return results
 
 
+async def _search_algolia(
+    client: httpx.AsyncClient, source: dict, query: str, n: int,
+) -> list[dict]:
+    """Search via Algolia DocSearch API."""
+    app_id = source["algolia_app_id"]
+    api_key = source["algolia_api_key"]
+    index_name = source["algolia_index"]
+    facet = source.get("algolia_facet")
+
+    url = f"https://{app_id}-dsn.algolia.net/1/indexes/{index_name}/query"
+    body: dict = {
+        "query": query,
+        "hitsPerPage": n,
+        "attributesToRetrieve": ["hierarchy", "url", "content"],
+        "attributesToSnippet": ["content:30"],
+    }
+    if facet:
+        body["facetFilters"] = [facet]
+
+    resp = await client.post(
+        url,
+        json=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Algolia-Application-Id": app_id,
+            "X-Algolia-API-Key": api_key,
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    results = []
+    for hit in data.get("hits", [])[:n]:
+        hl = hit.get("hierarchy", {})
+        parts = [v for v in hl.values() if isinstance(v, str) and v]
+        if parts:
+            title = " > ".join(parts)
+        elif hit.get("pageTitle"):
+            title = hit["pageTitle"]
+        elif hit.get("mainTitle"):
+            title = hit["mainTitle"]
+        else:
+            title = hit.get("url", "").split("/")[-1].replace(".html", "").replace("-", " ") or query
+        doc_url = hit.get("url", "")
+        if doc_url and not doc_url.startswith("http"):
+            site = source["sites"][0]
+            doc_url = f"https://{site}{doc_url}" if doc_url.startswith("/") else f"https://{site}/{doc_url}"
+        snippet = hit.get("_snippetResult", {}).get("content", {}).get("value", "")
+        if not snippet:
+            snippet = (hit.get("content", "") or "")[:100]
+        results.append({"title": title, "url": doc_url, "snippet": _decode(snippet)})
+    return results
+
+
+async def _search_mslearn(
+    client: httpx.AsyncClient, source: dict, query: str, n: int,
+) -> list[dict]:
+    """Search via Microsoft Learn REST API."""
+    url = f"https://learn.microsoft.com/api/search?search={quote_plus(query)}&locale=en-us&pageSize={n}"
+    resp = await client.get(url, headers={"User-Agent": UA})
+    resp.raise_for_status()
+    data = resp.json()
+
+    results = []
+    for item in data.get("results", [])[:n]:
+        title = item.get("title", "")
+        doc_url = item.get("url", "")
+        snippet = item.get("description", "")
+        results.append({"title": title, "url": doc_url, "snippet": snippet})
+    return results
+
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Helpers
 # ═══════════════════════════════════════════════════════════════════
@@ -734,21 +820,35 @@ async def call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
                 except Exception:
                     pass
 
-            # Strategy 3: Sphinx searchindex.js
+            # Strategy 3: Algolia DocSearch
+            if api == "algolia":
+                try:
+                    results = await _search_algolia(client, src, query, max_n)
+                except Exception:
+                    pass
+
+            # Strategy 4: Microsoft Learn
+            if api == "mslearn":
+                try:
+                    results = await _search_mslearn(client, src, query, max_n)
+                except Exception:
+                    pass
+
+            # Strategy 5: Sphinx searchindex.js
             if not results and src and src.get("sphinx_index"):
                 try:
                     results = await _search_sphinx(client, src, query, max_n)
                 except Exception:
                     pass
 
-            # Strategy 4: Generic search URL
+            # Strategy 6: Generic search URL
             if not results and src and src.get("search_url") and not api:
                 try:
                     results = await _search_generic(client, src, query, max_n)
                 except Exception:
                     pass
 
-            # Strategy 5: Bing fallback
+            # Strategy 7: Bing fallback
             if not results:
                 try:
                     sites = src["sites"] if src else []
