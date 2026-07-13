@@ -554,7 +554,20 @@ async def _search_generic(
     results: list[dict] = []
     seen: set[str] = set()
 
-    # Sphinx search results
+    skip = (
+        "next", "previous", "index", "modules", "home", "contents", "table of",
+        "log in", "login", "sign in", "sign up", "create account", "register",
+        "about", "about this site", "downloads", "download", "overview",
+        "manual", "documentation", "api", "reference", "getting started",
+        "learn", "en - english", "university", "apple developer",
+        "documentation changelog", "frequently asked questions", "list of features",
+        "python documentation contents", "glossary",
+        "trademark", "tools command line", "footer navigation",
+        "policies", "code of conduct", "your account", "community",
+        "developers", "issues", "discussion", "get involved", "support us",
+        "♥ donate", "|", "»", "«",
+    )
+
     for m in re.finditer(r'<li[^>]*>\s*<a\s+href="([^"]+)"[^>]*>(.*?)</a>', html, re.DOTALL):
         if len(results) >= n:
             break
@@ -562,11 +575,11 @@ async def _search_generic(
         title = _decode(_strip_html(m.group(2)))
         if not title or len(title) < 5 or title in seen:
             continue
-        skip = ("next", "previous", "index", "modules", "home", "contents", "table of")
-        if any(title.lower().startswith(w) for w in skip):
+        title_lower = title.lower().strip()
+        if any(title_lower == w or title_lower.startswith(w + " ") for w in skip):
             continue
         seen.add(title)
-        if href.startswith("#") or href.startswith("javascript:"):
+        if href.startswith("#") or href.startswith("javascript:") or href in ("/", ""):
             continue
         if not href.startswith("http"):
             base = "/".join(url.split("/")[:3])
@@ -655,6 +668,8 @@ async def _search_algolia(
         snippet = hit.get("_snippetResult", {}).get("content", {}).get("value", "")
         if not snippet:
             snippet = (hit.get("content", "") or "")[:100]
+        if not snippet:
+            snippet = title
         results.append({"title": title, "url": doc_url, "snippet": _decode(snippet)})
     return results
 
