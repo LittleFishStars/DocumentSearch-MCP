@@ -67,7 +67,7 @@ SOURCES: dict[str, dict] = {
         "name": "C++", "category": "programming_language",
         "desc": "C++ reference (cppreference)",
         "sites": ["en.cppreference.com"],
-        "search_url": "https://en.cppreference.com/mwiki/index.php?search={q}&title=Special%3ASearch",
+        "search_url": "https://en.cppreference.com/mwiki/index.php?search={q}",
     },
     "c": {
         "name": "C", "category": "programming_language",
@@ -286,7 +286,7 @@ SOURCES: dict[str, dict] = {
         "name": "LLVM", "category": "tool",
         "desc": "LLVM compiler infrastructure",
         "sites": ["llvm.org"],
-        "search_url": "https://llvm.org/search/?q={q}",
+        "search_url": "https://llvm.org/docs/Search.html?q={q}",
     },
     # ── database ───────────────────────────────────────────────────
     "postgresql": {
@@ -356,7 +356,7 @@ class SphinxIndex:
         if self._terms and not self._is_stale():
             return True
         try:
-            resp = await client.get(self.index_url, headers={"User-Agent": UA}, follow_redirects=True)
+            resp = await client.get(self.index_url, headers={"User-Agent": UA}, follow_redirects=True, timeout=30)
             resp.raise_for_status()
             self._parse(resp.text)
             self._loaded_at = time.time()
@@ -716,7 +716,7 @@ async def call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
             ))]
 
         results: list[dict] = []
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             src = SOURCES.get(source_key) if source_key else None
             api = src.get("api") if src else None
 
