@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """MCP Server for searching documentation of programming languages, game engines, and tools.
 
-Strategy:
-  1. MDN API – JSON search for web docs (JS, CSS, HTML, Web APIs)
-  2. docs.rs – HTML scraping for Rust crate search
-  3. Direct search-page links – for all other sources
-  4. fetch_doc_page – fetch and extract content from any doc URL
+Search backends (in priority order):
+  1. MDN API          – native JSON search for Mozilla Developer Network
+  2. docs.rs          – HTML scraping for Rust crate documentation
+  3. Sphinx index     – parse searchindex.js for Python, Flask, Godot, etc.
+  4. Bing fallback    – web search with domain post-filtering
 """
 
 import asyncio
 import json
 import re
+import time
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -23,311 +24,456 @@ server = Server("doc-search")
 
 UA = "Mozilla/5.0 (compatible; DocSearch-MCP/1.0)"
 
-SUPPORTED: dict[str, dict] = {
+CACHE_TTL = 1800  # 30 minute cache for search indexes
+
+# ═══════════════════════════════════════════════════════════════════
+#  Source definitions
+# ═══════════════════════════════════════════════════════════════════
+
+SOURCES: dict[str, dict] = {
     # ── programming_language ──────────────────────────────────────
     "python": {
         "name": "Python", "category": "programming_language",
+        "desc": "Python language documentation (Sphinx searchindex)",
         "sites": ["docs.python.org"],
-        "desc": "Python language documentation",
-        "search": "https://docs.python.org/3/search.html?q={q}",
+        "sphinx_base": "https://docs.python.org/3/",
+        "sphinx_index": "https://docs.python.org/3/searchindex.js",
     },
     "javascript": {
         "name": "JavaScript", "category": "programming_language",
+        "desc": "JavaScript/Web APIs (MDN native API)",
         "sites": ["developer.mozilla.org"],
-        "desc": "JavaScript (MDN) – direct API search",
-        "search": "https://developer.mozilla.org/en-US/search?q={q}",
         "api": "mdn",
-    },
-    "typescript": {
-        "name": "TypeScript", "category": "programming_language",
-        "sites": ["typescriptlang.org"],
-        "desc": "TypeScript language documentation",
-        "search": "https://www.typescriptlang.org/search/?search={q}",
     },
     "rust": {
         "name": "Rust", "category": "programming_language",
+        "desc": "Rust crates (docs.rs search)",
         "sites": ["doc.rust-lang.org", "docs.rs"],
-        "desc": "Rust std + crates (docs.rs direct search)",
-        "search": "https://docs.rs/releases/search?query={q}",
         "api": "docsrs",
+    },
+    "typescript": {
+        "name": "TypeScript", "category": "programming_language",
+        "desc": "TypeScript language docs",
+        "sites": ["typescriptlang.org"],
+        "search_url": "https://www.typescriptlang.org/search/?search={q}",
     },
     "go": {
         "name": "Go", "category": "programming_language",
+        "desc": "Go standard library & packages",
         "sites": ["pkg.go.dev", "go.dev"],
-        "desc": "Go package documentation",
-        "search": "https://pkg.go.dev/search?q={q}",
+        "search_url": "https://pkg.go.dev/search?q={q}",
     },
     "cpp": {
         "name": "C++", "category": "programming_language",
+        "desc": "C++ reference (cppreference)",
         "sites": ["en.cppreference.com"],
-        "desc": "C++ reference",
-        "search": "https://en.cppreference.com/mwiki/index.php?search={q}&title=Special%3ASearch",
+        "search_url": "https://en.cppreference.com/mwiki/index.php?search={q}&title=Special%3ASearch",
     },
     "c": {
         "name": "C", "category": "programming_language",
+        "desc": "C language reference (cppreference)",
         "sites": ["en.cppreference.com"],
-        "desc": "C language reference",
-        "search": "https://en.cppreference.com/mwiki/index.php?search={q}&title=Special%3ASearch",
+        "search_url": "https://en.cppreference.com/mwiki/index.php?search={q}&title=Special%3ASearch",
     },
     "java": {
         "name": "Java", "category": "programming_language",
-        "sites": ["docs.oracle.com"],
         "desc": "Java SE documentation",
-        "search": "https://docs.oracle.com/en/java/javase/23/docs/api/search.html?q={q}",
+        "sites": ["docs.oracle.com"],
+        "search_url": "https://docs.oracle.com/en/java/javase/23/docs/api/search.html?q={q}",
     },
     "csharp": {
         "name": "C#", "category": "programming_language",
+        "desc": "C# / .NET (Microsoft Learn)",
         "sites": ["learn.microsoft.com"],
-        "desc": "C# / .NET documentation",
-        "search": "https://learn.microsoft.com/en-us/dotnet/csharp/search/?search={q}",
+        "search_url": "https://learn.microsoft.com/en-us/dotnet/csharp/search/?search={q}",
     },
     "ruby": {
         "name": "Ruby", "category": "programming_language",
+        "desc": "Ruby language docs",
         "sites": ["docs.ruby-lang.org", "ruby-doc.org"],
-        "desc": "Ruby documentation",
-        "search": "https://docs.ruby-lang.org/en/master/search/index.html?q={q}",
+        "search_url": "https://docs.ruby-lang.org/en/master/search/index.html?q={q}",
     },
     "swift": {
         "name": "Swift", "category": "programming_language",
+        "desc": "Swift / Apple Developer",
         "sites": ["developer.apple.com"],
-        "desc": "Swift documentation",
-        "search": "https://developer.apple.com/search/?q={q}",
+        "search_url": "https://developer.apple.com/search/?q={q}",
     },
     "kotlin": {
         "name": "Kotlin", "category": "programming_language",
+        "desc": "Kotlin stdlib docs",
         "sites": ["kotlinlang.org"],
-        "desc": "Kotlin documentation",
-        "search": "https://kotlinlang.org/api/latest/jvm/stdlib/search.html?searchQuery={q}",
+        "search_url": "https://kotlinlang.org/api/latest/jvm/stdlib/search.html?searchQuery={q}",
     },
     "php": {
         "name": "PHP", "category": "programming_language",
+        "desc": "PHP manual",
         "sites": ["php.net"],
-        "desc": "PHP documentation",
-        "search": "https://www.php.net/manual-lookup.php?pattern={q}&lang=en",
+        "search_url": "https://www.php.net/manual-lookup.php?pattern={q}&lang=en",
     },
     "lua": {
         "name": "Lua", "category": "programming_language",
+        "desc": "Lua reference manual",
         "sites": ["lua.org"],
-        "desc": "Lua documentation",
-        "search": "https://www.lua.org/cgi-bin/search3.cgi?keywords={q}",
+        "search_url": "https://www.lua.org/cgi-bin/search3.cgi?keywords={q}",
     },
     "zig": {
         "name": "Zig", "category": "programming_language",
+        "desc": "Zig language reference",
         "sites": ["ziglang.org"],
-        "desc": "Zig documentation",
-        "search": "https://ziglang.org/documentation/master/#{q}",
+        "search_url": "https://ziglang.org/documentation/master/",
     },
     # ── game_engine ────────────────────────────────────────────────
     "unity": {
         "name": "Unity", "category": "game_engine",
-        "sites": ["docs.unity3d.com", "docs.unity.com"],
-        "desc": "Unity game engine",
-        "search": "https://docs.unity3d.com/ScriptReference/Search.html?q={q}",
+        "desc": "Unity game engine manual & scripting",
+        "sites": ["docs.unity3d.com"],
+        "search_url": "https://docs.unity3d.com/Manual/30_search.html?q={q}",
     },
     "unreal": {
         "name": "Unreal Engine", "category": "game_engine",
+        "desc": "Unreal Engine docs (Epic Dev)",
         "sites": ["docs.unrealengine.com", "dev.epicgames.com"],
-        "desc": "Unreal Engine documentation",
-        "search": "https://dev.epicgames.com/documentation/en-us/unreal-engine/search?q={q}",
+        "search_url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/search?q={q}",
     },
     "godot": {
         "name": "Godot", "category": "game_engine",
+        "desc": "Godot engine documentation (Sphinx)",
         "sites": ["docs.godotengine.org"],
-        "desc": "Godot game engine",
-        "search": "https://docs.godotengine.org/en/stable/search.html?q={q}&check_keywords=yes",
+        "sphinx_base": "https://docs.godotengine.org/en/stable/",
+        "sphinx_index": "https://docs.godotengine.org/en/stable/searchindex.js",
     },
     "bevy": {
         "name": "Bevy", "category": "game_engine",
-        "sites": ["bevyengine.org"],
         "desc": "Bevy game engine (Rust)",
-        "search": "https://bevyengine.org/learn/book/search/?q={q}",
+        "sites": ["bevyengine.org"],
+        "search_url": "https://bevyengine.org/learn/book/search/?q={q}",
     },
     "cocos": {
         "name": "Cocos Creator", "category": "game_engine",
+        "desc": "Cocos Creator game engine",
         "sites": ["docs.cocos.com"],
-        "desc": "Cocos Creator engine",
-        "search": "https://docs.cocos.com/creator/manual/en/?q={q}",
+        "search_url": "https://docs.cocos.com/creator/manual/en/?q={q}",
     },
     # ── framework ──────────────────────────────────────────────────
     "react": {
         "name": "React", "category": "framework",
-        "sites": ["react.dev"],
         "desc": "React framework",
-        "search": "https://react.dev/search?q={q}",
+        "sites": ["react.dev"],
+        "search_url": "https://react.dev/search?q={q}",
     },
     "vue": {
         "name": "Vue.js", "category": "framework",
-        "sites": ["vuejs.org"],
         "desc": "Vue.js framework",
-        "search": "https://vuejs.org/search.html?query={q}",
+        "sites": ["vuejs.org"],
+        "search_url": "https://vuejs.org/search.html?query={q}",
     },
     "angular": {
         "name": "Angular", "category": "framework",
-        "sites": ["angular.dev"],
         "desc": "Angular framework",
-        "search": "https://angular.dev/search?search={q}",
+        "sites": ["angular.dev"],
+        "search_url": "https://angular.dev/search?search={q}",
     },
     "svelte": {
         "name": "Svelte", "category": "framework",
-        "sites": ["svelte.dev"],
         "desc": "Svelte framework",
-        "search": "https://svelte.dev/docs/search?q={q}",
+        "sites": ["svelte.dev"],
+        "search_url": "https://svelte.dev/docs/search?q={q}",
     },
     "nextjs": {
         "name": "Next.js", "category": "framework",
-        "sites": ["nextjs.org"],
         "desc": "Next.js framework",
-        "search": "https://nextjs.org/search?q={q}",
+        "sites": ["nextjs.org"],
+        "search_url": "https://nextjs.org/search?q={q}",
     },
     "django": {
         "name": "Django", "category": "framework",
-        "sites": ["docs.djangoproject.com"],
         "desc": "Django web framework",
-        "search": "https://docs.djangoproject.com/en/stable/search/?q={q}",
+        "sites": ["docs.djangoproject.com"],
+        "search_url": "https://docs.djangoproject.com/en/stable/search/?q={q}",
     },
     "flask": {
         "name": "Flask", "category": "framework",
+        "desc": "Flask web framework (Sphinx)",
         "sites": ["flask.palletsprojects.com"],
-        "desc": "Flask web framework",
-        "search": "https://flask.palletsprojects.com/en/stable/search/?q={q}",
+        "sphinx_base": "https://flask.palletsprojects.com/en/stable/",
+        "sphinx_index": "https://flask.palletsprojects.com/en/stable/searchindex.js",
     },
     "fastapi": {
         "name": "FastAPI", "category": "framework",
-        "sites": ["fastapi.tiangolo.com"],
         "desc": "FastAPI framework",
-        "search": "https://fastapi.tiangolo.com/search/?q={q}",
+        "sites": ["fastapi.tiangolo.com"],
+        "search_url": "https://fastapi.tiangolo.com/search/?q={q}",
     },
     "rails": {
         "name": "Ruby on Rails", "category": "framework",
+        "desc": "Ruby on Rails guides & API",
         "sites": ["guides.rubyonrails.org", "api.rubyonrails.org"],
-        "desc": "Ruby on Rails",
-        "search": "https://guides.rubyonrails.org/search/?q={q}",
+        "search_url": "https://guides.rubyonrails.org/search/?q={q}",
     },
     "pytorch": {
         "name": "PyTorch", "category": "framework",
+        "desc": "PyTorch ML framework (Sphinx)",
         "sites": ["pytorch.org"],
-        "desc": "PyTorch ML framework",
-        "search": "https://pytorch.org/docs/stable/search.html?q={q}&check_keywords=yes",
+        "sphinx_base": "https://pytorch.org/docs/stable/",
+        "sphinx_index": "https://pytorch.org/docs/stable/searchindex.js",
     },
     "tensorflow": {
         "name": "TensorFlow", "category": "framework",
-        "sites": ["tensorflow.org"],
         "desc": "TensorFlow ML framework",
-        "search": "https://www.tensorflow.org/s/results?q={q}",
+        "sites": ["tensorflow.org"],
+        "search_url": "https://www.tensorflow.org/s/results?q={q}",
     },
     # ── graphics ───────────────────────────────────────────────────
     "opengl": {
         "name": "OpenGL", "category": "graphics",
-        "sites": ["docs.gl", "registry.khronos.org"],
         "desc": "OpenGL API reference",
-        "search": "http://docs.gl/?search={q}",
+        "sites": ["docs.gl", "registry.khronos.org"],
+        "search_url": "http://docs.gl/?search={q}",
     },
     "vulkan": {
         "name": "Vulkan", "category": "graphics",
+        "desc": "Vulkan API docs (Sphinx)",
         "sites": ["registry.khronos.org", "docs.vulkan.org"],
-        "desc": "Vulkan API reference",
-        "search": "https://docs.vulkan.org/search.html?q={q}&check_keywords=yes",
+        "sphinx_base": "https://docs.vulkan.org/",
+        "sphinx_index": "https://docs.vulkan.org/searchindex.js",
     },
     "webgpu": {
         "name": "WebGPU", "category": "graphics",
+        "desc": "WebGPU API (MDN + spec)",
         "sites": ["gpuweb.github.io", "developer.mozilla.org"],
-        "desc": "WebGPU API documentation",
-        "search": "https://developer.mozilla.org/en-US/search?q={q}+WebGPU",
+        "search_url": "https://developer.mozilla.org/en-US/search?q={q}+WebGPU",
     },
     "wgpu": {
         "name": "wgpu", "category": "graphics",
+        "desc": "wgpu Rust graphics library (docs.rs)",
         "sites": ["docs.rs/wgpu"],
-        "desc": "wgpu Rust graphics library",
-        "search": "https://docs.rs/releases/search?query={q}+wgpu",
         "api": "docsrs",
     },
     # ── tool ───────────────────────────────────────────────────────
     "docker": {
         "name": "Docker", "category": "tool",
-        "sites": ["docs.docker.com"],
         "desc": "Docker documentation",
-        "search": "https://docs.docker.com/search/?q={q}",
+        "sites": ["docs.docker.com"],
+        "search_url": "https://docs.docker.com/search/?q={q}",
     },
     "kubernetes": {
         "name": "Kubernetes", "category": "tool",
+        "desc": "Kubernetes docs",
         "sites": ["kubernetes.io"],
-        "desc": "Kubernetes documentation",
-        "search": "https://kubernetes.io/search/?q={q}",
+        "search_url": "https://kubernetes.io/docs/search/?q={q}",
     },
     "git": {
         "name": "Git", "category": "tool",
+        "desc": "Git reference manual",
         "sites": ["git-scm.com"],
-        "desc": "Git documentation",
-        "search": "https://git-scm.com/search/results?search={q}",
+        "search_url": "https://git-scm.com/search/results?search={q}",
     },
     "ffmpeg": {
         "name": "FFmpeg", "category": "tool",
+        "desc": "FFmpeg multimedia framework",
         "sites": ["ffmpeg.org"],
-        "desc": "FFmpeg documentation",
-        "search": "https://ffmpeg.org/search.html?q={q}",
+        "search_url": "https://ffmpeg.org/search.html?q={q}",
     },
     "cmake": {
         "name": "CMake", "category": "tool",
+        "desc": "CMake build system (Sphinx)",
         "sites": ["cmake.org"],
-        "desc": "CMake build system",
-        "search": "https://cmake.org/cmake/help/latest/search.html?q={q}&check_keywords=yes",
+        "sphinx_base": "https://cmake.org/cmake/help/latest/",
+        "sphinx_index": "https://cmake.org/cmake/help/latest/searchindex.js",
     },
     "llvm": {
         "name": "LLVM", "category": "tool",
+        "desc": "LLVM compiler infrastructure",
         "sites": ["llvm.org"],
-        "desc": "LLVM compiler docs",
-        "search": "https://llvm.org/search/?q={q}",
+        "search_url": "https://llvm.org/search/?q={q}",
     },
     # ── database ───────────────────────────────────────────────────
     "postgresql": {
         "name": "PostgreSQL", "category": "database",
-        "sites": ["postgresql.org"],
         "desc": "PostgreSQL database",
-        "search": "https://www.postgresql.org/search/?u=%2Fdocs%2Fcurrent%2F&q={q}",
+        "sites": ["postgresql.org"],
+        "search_url": "https://www.postgresql.org/search/?u=%2Fdocs%2Fcurrent%2F&q={q}",
     },
     "mysql": {
         "name": "MySQL", "category": "database",
+        "desc": "MySQL database docs",
         "sites": ["dev.mysql.com"],
-        "desc": "MySQL database",
-        "search": "https://dev.mysql.com/doc/search/?d=10&p=1&q={q}",
+        "search_url": "https://dev.mysql.com/doc/search/?d=10&p=1&q={q}",
     },
     "mongodb": {
         "name": "MongoDB", "category": "database",
+        "desc": "MongoDB documentation",
         "sites": ["mongodb.com"],
-        "desc": "MongoDB database",
-        "search": "https://www.mongodb.com/docs/search/?q={q}",
+        "search_url": "https://www.mongodb.com/docs/search/?q={q}",
     },
     "redis": {
         "name": "Redis", "category": "database",
-        "sites": ["redis.io"],
         "desc": "Redis documentation",
-        "search": "https://redis.io/search/?q={q}",
+        "sites": ["redis.io"],
+        "search_url": "https://redis.io/search/?q={q}",
     },
-    # ── system ─────────────────────────────────────────────────────
+    # ── system / library ───────────────────────────────────────────
     "linux": {
-        "name": "Linux Kernel / man-pages", "category": "system",
-        "sites": ["kernel.org", "man7.org"],
+        "name": "Linux man-pages", "category": "system",
         "desc": "Linux kernel & man pages",
-        "search": "https://man7.org/linux/man-pages/search.php?cmd=search&q={q}",
+        "sites": ["kernel.org", "man7.org"],
+        "search_url": "https://man7.org/linux/man-pages/search.php?cmd=search&q={q}",
     },
-    # ── library ────────────────────────────────────────────────────
     "opencv": {
         "name": "OpenCV", "category": "library",
+        "desc": "OpenCV computer vision library",
         "sites": ["docs.opencv.org"],
-        "desc": "OpenCV computer vision",
-        "search": "https://docs.opencv.org/4.x/search.html?q={q}&check_keywords=yes",
+        "search_url": "https://docs.opencv.org/4.x/search.html?q={q}&check_keywords=yes",
     },
 }
 
-CATEGORIES = sorted(set(s["category"] for s in SUPPORTED.values()))
+CATEGORIES = sorted(set(s["category"] for s in SOURCES.values()))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Sphinx searchindex.js engine
+# ═══════════════════════════════════════════════════════════════════
+
+class SphinxIndex:
+    """Downloads, parses, caches, and searches a Sphinx searchindex.js."""
+
+    def __init__(self, index_url: str, base_url: str):
+        self.index_url = index_url
+        self.base_url = base_url.rstrip("/") + "/"
+        self._docnames: list[str] = []
+        self._filenames: list[str] = []
+        self._titles: list[str] = []
+        self._terms: dict[str, list[int]] = {}
+        self._indexentries: dict[str, list] = {}
+        self._objects: dict[str, list] = {}
+        self._loaded_at: float = 0
+
+    def _is_stale(self) -> bool:
+        return time.time() - self._loaded_at > CACHE_TTL
+
+    async def _ensure_loaded(self, client: httpx.AsyncClient) -> bool:
+        if self._terms and not self._is_stale():
+            return True
+        try:
+            resp = await client.get(self.index_url, headers={"User-Agent": UA}, follow_redirects=True)
+            resp.raise_for_status()
+            self._parse(resp.text)
+            self._loaded_at = time.time()
+            return True
+        except Exception:
+            return bool(self._terms)
+
+    def _parse(self, js_text: str) -> None:
+        m = re.search(r"Search\.setIndex\((.*)\);?\s*$", js_text, re.DOTALL)
+        if not m:
+            return
+        idx = json.loads(m.group(1))
+        self._docnames = idx.get("docnames", [])
+        self._filenames = idx.get("filenames", [])
+        self._titles = idx.get("titles", [])
+        self._terms = idx.get("terms", {})
+        self._indexentries: dict[str, list] = idx.get("indexentries", {})
+        self._objects: dict[str, list] = idx.get("objects", {})
+
+    def search(self, query: str, max_results: int) -> list[dict]:
+        if not self._terms:
+            return []
+        query_lower = query.lower()
+        tokens = query_lower.split()
+        total_docs = max(len(self._docnames), 1)
+        results: list[dict] = []
+        seen: set[int] = set()
+
+        # Stage 1: Exact phrase matches from indexentries (highest priority)
+        if self._indexentries:
+            for phrase, entries in self._indexentries.items():
+                phrase_lower = phrase.lower()
+                # Only match if full query is a substring of the phrase, or vice versa
+                if query_lower == phrase_lower or (len(query_lower) > 5 and query_lower in phrase_lower):
+                    for entry in entries[:3]:
+                        doc_idx = entry[0] if isinstance(entry, list) else entry
+                        anchor = entry[1] if isinstance(entry, list) and len(entry) > 1 and isinstance(entry[1], str) else ""
+                        if doc_idx not in seen and doc_idx < len(self._titles):
+                            seen.add(doc_idx)
+                            results.append(self._make_result(doc_idx, anchor, f"indexed: {phrase}"))
+
+        # Stage 2: Token-based search
+        scores: dict[int, float] = {}
+        for token in tokens:
+            if token in self._terms:
+                indices = self._terms[token]
+                df = len(indices)
+                idf = 0.5 + (1.0 if df < total_docs * 0.03 else 0.3 if df < total_docs * 0.10 else 0.1)
+                for di in indices:
+                    if di not in seen:
+                        scores[di] = scores.get(di, 0.0) + idf
+
+        # Title phrase boost
+        clean_titles = [_decode(_strip_html(t)).lower() for t in self._titles]
+        for di, ct in enumerate(clean_titles):
+            if di in seen:
+                continue
+            if query_lower in ct:
+                scores[di] = scores.get(di, 0.0) + 3.0
+            else:
+                matched = sum(1 for t in tokens if t in ct)
+                if matched >= len(tokens) * 0.6 and len(tokens) >= 2:
+                    scores[di] = scores.get(di, 0.0) + matched * 0.5
+
+        ranked = sorted(scores.items(), key=lambda x: -x[1])
+        for doc_idx, score in ranked:
+            if len(results) >= max_results:
+                break
+            if doc_idx not in seen and doc_idx < len(self._titles):
+                seen.add(doc_idx)
+                results.append(self._make_result(doc_idx, "", f"score: {score:.2f}"))
+
+        # Stage 3: Object matches (API names, class names, etc.)
+        if self._objects and len(results) < max_results:
+            for obj_name, obj_info in self._objects.items():
+                obj_lower = obj_name.lower()
+                if query_lower in obj_lower or (len(obj_lower) > 3 and obj_lower in query_lower):
+                    doc_idx = obj_info[0] if isinstance(obj_info, list) else obj_info
+                    anchor = obj_info[1] if isinstance(obj_info, list) and len(obj_info) > 1 and isinstance(obj_info[1], str) else ""
+                    if doc_idx not in seen and doc_idx < len(self._titles):
+                        seen.add(doc_idx)
+                        results.append(self._make_result(doc_idx, anchor, f"object: {obj_name}"))
+
+        return results[:max_results]
+
+    def _make_result(self, doc_idx: int, anchor: str, snippet: str) -> dict:
+        title_html = self._titles[doc_idx].strip() if doc_idx < len(self._titles) else "???"
+        title = _decode(_strip_html(title_html))
+        filename = self._filenames[doc_idx] if doc_idx < len(self._filenames) else "???"
+        if filename.endswith(".rst"):
+            filename = filename[:-4] + ".html"
+        url = self.base_url + filename
+        if anchor:
+            url += "#" + anchor
+        return {"title": title, "url": url, "snippet": snippet}
+
+
+# Global Sphinx index cache
+_sphinx_cache: dict[str, SphinxIndex] = {}
+
+
+def _get_sphinx(source: dict) -> SphinxIndex | None:
+    """Get or create a cached SphinxIndex for the given source."""
+    idx_url = source.get("sphinx_index")
+    base_url = source.get("sphinx_base")
+    if not idx_url or not base_url:
+        return None
+    if idx_url not in _sphinx_cache:
+        _sphinx_cache[idx_url] = SphinxIndex(idx_url, base_url)
+    return _sphinx_cache[idx_url]
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  Search backends
 # ═══════════════════════════════════════════════════════════════════
 
-async def _mdn_api(client: httpx.AsyncClient, query: str, n: int) -> list[dict]:
-    """MDN search API – returns JSON."""
+async def _search_mdn(client: httpx.AsyncClient, query: str, n: int) -> list[dict]:
     url = f"https://developer.mozilla.org/api/v1/search?q={quote_plus(query)}&locale=en-US"
     resp = await client.get(url, headers={"User-Agent": UA})
     resp.raise_for_status()
@@ -345,8 +491,7 @@ async def _mdn_api(client: httpx.AsyncClient, query: str, n: int) -> list[dict]:
     return results
 
 
-async def _docsrs(client: httpx.AsyncClient, query: str, n: int) -> list[dict]:
-    """Scrape docs.rs search results page."""
+async def _search_docsrs(client: httpx.AsyncClient, query: str, n: int) -> list[dict]:
     url = f"https://docs.rs/releases/search?query={quote_plus(query)}"
     resp = await client.get(url, headers={"User-Agent": UA})
     resp.raise_for_status()
@@ -359,32 +504,69 @@ async def _docsrs(client: httpx.AsyncClient, query: str, n: int) -> list[dict]:
         if len(results) >= n:
             break
         href = m.group(1)
-        inner = m.group(2)
-        title = re.sub(r"<[^>]+>", "", inner).strip()
-        # skip nav-only links
+        title = _decode(_strip_html(m.group(2)))
         if len(title) < 5 or title in ("Docs.rs", "Rust", ""):
             continue
-        # Try to extract snippet from surrounding context
         snippet = ""
         ctx = html[max(0, m.start() - 200):m.end() + 300]
         desc_m = re.search(r'<span[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</span>', ctx, re.DOTALL)
         if desc_m:
-            snippet = _strip_html(desc_m.group(1))
-        results.append({
-            "title": title,
-            "url": "https://docs.rs" + href,
-            "snippet": snippet,
-        })
+            snippet = _decode(_strip_html(desc_m.group(1)))
+        results.append({"title": title, "url": "https://docs.rs" + href, "snippet": snippet})
     return results
 
 
-async def _bing_fallback(client: httpx.AsyncClient, query: str, source_key: str | None, n: int) -> list[dict]:
-    """Bing search with domain post-filter. Used when direct search fails."""
-    source = SUPPORTED.get(source_key) if source_key else None
-    sites = source["sites"] if source else []
+async def _search_sphinx(
+    client: httpx.AsyncClient, source: dict, query: str, n: int,
+) -> list[dict]:
+    idx = _get_sphinx(source)
+    if not idx:
+        return []
+    ok = await idx._ensure_loaded(client)
+    if not ok:
+        return []
+    return idx.search(query, n)
+
+
+async def _search_generic(
+    client: httpx.AsyncClient, source: dict, query: str, n: int,
+) -> list[dict]:
+    """Try the search URL directly and extract any server-rendered results."""
+    url_tpl = source.get("search_url")
+    if not url_tpl:
+        return []
+    url = url_tpl.replace("{q}", quote_plus(query))
+    resp = await client.get(url, headers={"User-Agent": UA}, follow_redirects=True)
+    html = resp.text
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    # Sphinx search results
+    for m in re.finditer(r'<li[^>]*>\s*<a\s+href="([^"]+)"[^>]*>(.*?)</a>', html, re.DOTALL):
+        if len(results) >= n:
+            break
+        href = m.group(1)
+        title = _decode(_strip_html(m.group(2)))
+        if not title or len(title) < 5 or title in seen:
+            continue
+        skip = ("next", "previous", "index", "modules", "home", "contents", "table of")
+        if any(title.lower().startswith(w) for w in skip):
+            continue
+        seen.add(title)
+        if href.startswith("#") or href.startswith("javascript:"):
+            continue
+        if not href.startswith("http"):
+            base = "/".join(url.split("/")[:3])
+            href = base + href if href.startswith("/") else base + "/" + href
+        results.append({"title": title, "url": href, "snippet": ""})
+    return results
+
+
+async def _search_bing(
+    client: httpx.AsyncClient, query: str, sites: list[str], n: int,
+) -> list[dict]:
     domains_q = " OR ".join(sites) if sites else ""
     bing_q = f"{query} {domains_q}".strip()
-
     resp = await client.get(
         "https://www.bing.com/search",
         params={"q": bing_q, "count": min(n * 3, 20)},
@@ -401,10 +583,10 @@ async def _bing_fallback(client: httpx.AsyncClient, query: str, source_key: str 
             continue
         href = m.group(1)
         title = _decode(_strip_html(m.group(2)))
-        snippet_m = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
-        snippet = _decode(_strip_html(snippet_m.group(1))) if snippet_m else ""
+        sm = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
+        snippet = _decode(_strip_html(sm.group(1))) if sm else ""
         snippet = re.sub(r"\s+", " ", snippet).strip()
-        if source_key and sites and not any(s in href for s in sites):
+        if sites and not any(s in href for s in sites):
             continue
         results.append({"title": title, "url": href, "snippet": snippet})
     return results
@@ -419,7 +601,11 @@ def _strip_html(s: str) -> str:
 
 
 def _decode(s: str) -> str:
-    return s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'").replace("&#x27;", "'").replace("&nbsp;", " ")
+    return (
+        s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", '"').replace("&#39;", "'").replace("&#x27;", "'")
+        .replace("&nbsp;", " ").replace("&#64;", "@")
+    )
 
 
 def _clean(text: str) -> str:
@@ -452,17 +638,17 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_docs",
             description="Search documentation for programming languages, game engines, frameworks, and tools. "
-            "Returns titles, URLs, and snippets from official doc sites.",
+            "Uses native search APIs/indices for best results.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query, e.g. 'async/await', 'useState hook', 'Vec push'",
+                        "description": "Search query (e.g. 'Vec push', 'useState', 'SELECT')",
                     },
                     "source": {
                         "type": "string",
-                        "description": "Source key to restrict search (use list_sources to see all keys). Omit for all sources.",
+                        "description": "Source key (use list_sources to see all). Omit for all sources.",
                     },
                     "max_results": {
                         "type": "integer",
@@ -475,13 +661,13 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="list_sources",
-            description=f"List all {len(SUPPORTED)} supported documentation sources with keys, categories, and descriptions.",
+            description=f"List all {len(SOURCES)} supported documentation sources.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "category": {
                         "type": "string",
-                        "description": f"Filter by category: {', '.join(CATEGORIES)}",
+                        "description": f"Filter by: {', '.join(CATEGORIES)}",
                     },
                 },
             },
@@ -508,12 +694,13 @@ async def call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
     if name == "list_sources":
         cat = args.get("category", "")
         items = []
-        for k, v in SUPPORTED.items():
+        for k, v in SOURCES.items():
             if cat and v["category"] != cat:
                 continue
             items.append({
                 "key": k, "name": v["name"], "category": v["category"],
-                "description": v["desc"], "search_url": v["search"],
+                "description": v["desc"],
+                "backend": v.get("api", "sphinx" if "sphinx_index" in v else "search_url" if "search_url" in v else "bing"),
             })
         out = {"categories": CATEGORIES, "sources": items} if not cat else {"category": cat, "sources": items}
         return [TextContent(type="text", text=json.dumps(out, indent=2, ensure_ascii=False))]
@@ -521,79 +708,59 @@ async def call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
     elif name == "search_docs":
         query = args["query"]
         source_key = args.get("source")
-        max_results = min(args.get("max_results", 10), 20)
+        max_n = min(args.get("max_results", 10), 20)
 
-        if source_key and source_key not in SUPPORTED:
+        if source_key and source_key not in SOURCES:
             return [TextContent(type="text", text=json.dumps(
                 {"error": f"Unknown source '{source_key}'. Use list_sources."}, indent=2,
             ))]
 
         results: list[dict] = []
-        search_url = ""
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            # Strategy 1: Direct API
-            src = SUPPORTED.get(source_key) if source_key else None
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            src = SOURCES.get(source_key) if source_key else None
             api = src.get("api") if src else None
 
-            if api == "mdn" or (not source_key):
+            # Strategy 1: MDN API
+            if api == "mdn" or (not source_key and not api):
                 try:
-                    results = await _mdn_api(client, query, max_results)
-                    if source_key and results:
-                        search_url = f"https://developer.mozilla.org/en-US/search?q={quote_plus(query)}"
+                    results = await _search_mdn(client, query, max_n)
                 except Exception:
                     pass
 
+            # Strategy 2: docs.rs
             if api == "docsrs":
                 try:
-                    results = await _docsrs(client, query, max_results)
-                    if results:
-                        search_url = SUPPORTED[source_key]["search"].replace("{q}", quote_plus(query))
+                    results = await _search_docsrs(client, query, max_n)
                 except Exception:
                     pass
 
-            # Strategy 2: Try direct search page for the specific source
-            if not results and source_key and not api:
+            # Strategy 3: Sphinx searchindex.js
+            if not results and src and src.get("sphinx_index"):
                 try:
-                    url = src["search"].replace("{q}", quote_plus(query))
-                    resp = await client.get(url, headers={"User-Agent": UA})
-                    search_url = url
-                    # Try Sphinx/standard search result list patterns
-                    html = resp.text
-                    seen = set()
-                    for pattern in [
-                        r'<li[^>]*>\s*<a\s+href="([^"]+)"[^>]*>(.*?)</a>',
-                        r'<a\s+href="([^"]+)"[^>]*class="[^"]*result[^"]*"[^>]*>(.*?)</a>',
-                    ]:
-                        for m in re.finditer(pattern, html, re.DOTALL):
-                            if len(results) >= max_results:
-                                break
-                            href = m.group(1)
-                            title = _decode(_strip_html(m.group(2))).strip()
-                            if not title or title in seen or len(title) < 3:
-                                continue
-                            seen.add(title)
-                            if href.startswith("#") or href.startswith("javascript:"):
-                                continue
-                            if not href.startswith("http"):
-                                base = "/".join(url.split("/")[:3])
-                                href = base + href if href.startswith("/") else base + "/" + href
-                            results.append({"title": title, "url": href, "snippet": ""})
+                    results = await _search_sphinx(client, src, query, max_n)
                 except Exception:
                     pass
 
-            # Strategy 3: Bing fallback
+            # Strategy 4: Generic search URL
+            if not results and src and src.get("search_url") and not api:
+                try:
+                    results = await _search_generic(client, src, query, max_n)
+                except Exception:
+                    pass
+
+            # Strategy 5: Bing fallback
             if not results:
                 try:
-                    results = await _bing_fallback(client, query, source_key, max_results)
+                    sites = src["sites"] if src else []
+                    results = await _search_bing(client, query, sites, max_n)
                 except Exception:
                     pass
 
-        source_name = SUPPORTED[source_key]["name"] if source_key else "all sources"
+        source_name = src["name"] if src else "all sources"
         output = {
             "query": query,
             "source": source_name,
             "source_key": source_key,
-            "search_url": search_url or f"https://www.bing.com/search?q={quote_plus(query)}",
             "total_results": len(results),
             "results": results,
         }
