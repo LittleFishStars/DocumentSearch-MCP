@@ -56,6 +56,7 @@ SOURCES: dict[str, dict] = {
         "desc": "TypeScript language docs",
         "sites": ["typescriptlang.org"],
         "search_url": "https://www.typescriptlang.org/search/?search={q}",
+        "grep_url": "https://www.typescriptlang.org/docs/handbook/",
     },
     "go": {
         "name": "Go", "category": "programming_language",
@@ -100,6 +101,7 @@ SOURCES: dict[str, dict] = {
         "desc": "Swift / Apple Developer",
         "sites": ["developer.apple.com"],
         "search_url": "https://developer.apple.com/search/?q={q}",
+        "grep_url": "https://docs.swift.org/swift-book/",
     },
     "kotlin": {
         "name": "Kotlin", "category": "programming_language",
@@ -115,18 +117,21 @@ SOURCES: dict[str, dict] = {
         "desc": "PHP manual",
         "sites": ["php.net"],
         "search_url": "https://www.php.net/manual-lookup.php?pattern={q}&lang=en",
+        "grep_url": "https://www.php.net/manual/en/",
     },
     "lua": {
         "name": "Lua", "category": "programming_language",
         "desc": "Lua reference manual",
         "sites": ["lua.org"],
         "search_url": "https://www.lua.org/cgi-bin/search3.cgi?keywords={q}",
+        "grep_url": "https://www.lua.org/manual/5.4/",
     },
     "zig": {
         "name": "Zig", "category": "programming_language",
         "desc": "Zig language reference",
         "sites": ["ziglang.org"],
         "search_url": "https://ziglang.org/documentation/master/",
+        "grep_url": "https://ziglang.org/documentation/master/",
     },
     # ── game_engine ────────────────────────────────────────────────
     "unity": {
@@ -153,12 +158,14 @@ SOURCES: dict[str, dict] = {
         "desc": "Bevy game engine (Rust)",
         "sites": ["bevyengine.org"],
         "search_url": "https://bevyengine.org/learn/book/search/?q={q}",
+        "grep_url": "https://bevyengine.org/learn/book/introduction/",
     },
     "cocos": {
         "name": "Cocos Creator", "category": "game_engine",
         "desc": "Cocos Creator game engine",
         "sites": ["docs.cocos.com"],
         "search_url": "https://docs.cocos.com/creator/manual/en/?q={q}",
+        "grep_url": "https://docs.cocos.com/creator/manual/en/",
     },
     # ── framework ──────────────────────────────────────────────────
     "react": {
@@ -225,6 +232,7 @@ SOURCES: dict[str, dict] = {
         "desc": "Ruby on Rails guides & API",
         "sites": ["guides.rubyonrails.org", "api.rubyonrails.org"],
         "search_url": "https://guides.rubyonrails.org/search/?q={q}",
+        "grep_url": "https://guides.rubyonrails.org/",
     },
     "pytorch": {
         "name": "PyTorch", "category": "framework",
@@ -289,6 +297,7 @@ SOURCES: dict[str, dict] = {
         "desc": "FFmpeg multimedia framework",
         "sites": ["ffmpeg.org"],
         "search_url": "https://ffmpeg.org/search.html?q={q}",
+        "grep_url": "https://ffmpeg.org/documentation.html",
     },
     "cmake": {
         "name": "CMake", "category": "tool",
@@ -302,6 +311,7 @@ SOURCES: dict[str, dict] = {
         "desc": "LLVM compiler infrastructure",
         "sites": ["llvm.org"],
         "search_url": "https://llvm.org/docs/Search.html?q={q}",
+        "grep_url": "https://llvm.org/docs/",
     },
     # ── database ───────────────────────────────────────────────────
     "postgresql": {
@@ -334,12 +344,14 @@ SOURCES: dict[str, dict] = {
         "desc": "Linux kernel & man pages",
         "sites": ["kernel.org", "man7.org"],
         "search_url": "https://man7.org/linux/man-pages/search.php?cmd=search&q={q}",
+        "grep_url": "https://man7.org/linux/man-pages/man2/open.2.html",
     },
     "opencv": {
         "name": "OpenCV", "category": "library",
         "desc": "OpenCV computer vision library",
         "sites": ["docs.opencv.org"],
         "search_url": "https://docs.opencv.org/4.x/search.html?q={q}&check_keywords=yes",
+        "grep_url": "https://docs.opencv.org/4.x/",
     },
 }
 
@@ -822,6 +834,57 @@ async def _search_ruby(
     return idx.search(query, n)
 
 
+async def _search_local_grep(
+    client: httpx.AsyncClient, source: dict, query: str, n: int,
+) -> list[dict]:
+    """Fetch a documentation page and search for keywords in its text content."""
+    grep_url = source.get("grep_url", "")
+    if not grep_url:
+        return []
+    resp = await client.get(grep_url, headers={"User-Agent": UA}, follow_redirects=True)
+    resp.raise_for_status()
+    text = _extract_main(resp.text)
+    text = _clean(text)
+
+    tokens = query.lower().split()
+    # Split into paragraphs
+    paragraphs = re.split(r'\n\n+', text)
+    matches = []
+    for i, para in enumerate(paragraphs):
+        para_lower = para.lower()
+        score = sum(1 for t in tokens if t in para_lower)
+        if score > 0:
+            # Find section heading before this paragraph
+            heading = ""
+            for j in range(i - 1, max(i - 5, -1), -1):
+                prev = paragraphs[j].strip()
+                if len(prev) < 80 and prev and not prev.startswith(" "):
+                    heading = prev
+                    break
+            snippet = para[:300].strip()
+            if len(para) > 300:
+                snippet += "..."
+            matches.append({
+                "score": score + (2 if heading and any(t in heading.lower() for t in tokens) else 0),
+                "heading": heading,
+                "snippet": snippet,
+                "para_idx": i,
+            })
+
+    # Rank by score
+    matches.sort(key=lambda m: -m["score"])
+    results = []
+    for m in matches[:n]:
+        title = m["heading"] or f"Match in {source['name']} docs"
+        url = grep_url
+        results.append({
+            "title": title,
+            "url": url,
+            "snippet": m["snippet"],
+        })
+    return results
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Helpers
 # ═══════════════════════════════════════════════════════════════════
@@ -996,6 +1059,13 @@ async def call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
             if not results and src and src.get("search_url") and not api:
                 try:
                     results = await _search_generic(client, src, query, max_n)
+                except Exception:
+                    pass
+
+            # Strategy 7b: Local grep fallback
+            if not results and src and src.get("grep_url"):
+                try:
+                    results = await _search_local_grep(client, src, query, max_n)
                 except Exception:
                     pass
 
