@@ -500,6 +500,27 @@ def _get_sphinx(source: dict) -> SphinxIndex | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Headless browser pool (lazy init)
+# ═══════════════════════════════════════════════════════════════════
+
+_browser = None
+_browser_lock = asyncio.Lock()
+
+
+async def _get_browser():
+    global _browser
+    if _browser is not None:
+        return _browser
+    async with _browser_lock:
+        if _browser is not None:
+            return _browser
+        from playwright.async_api import async_playwright
+        _playwright = await async_playwright().start()
+        _browser = await _playwright.firefox.launch(headless=True)
+        return _browser
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Ruby search_data.js engine
 # ═══════════════════════════════════════════════════════════════════
 
@@ -885,6 +906,49 @@ async def _search_local_grep(
     return results
 
 
+async def _search_headless(
+    client: httpx.AsyncClient, source: dict, query: str, n: int,
+) -> list[dict]:
+    """Use headless browser to load a JS-rendered search page and extract results."""
+    search_url_tpl = source.get("search_url", "")
+    if not search_url_tpl:
+        return []
+    url = search_url_tpl.replace("{q}", quote_plus(query))
+
+    try:
+        browser = await _get_browser()
+        page = await browser.new_page()
+        await page.goto(url, timeout=15000, wait_until="domcontentloaded")
+        # Wait briefly for JS to render
+        await asyncio.sleep(2)
+        text = await page.inner_text('body')
+        await page.close()
+    except Exception:
+        return []
+
+    # Search for keywords in the rendered text
+    tokens = query.lower().split()
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    results = []
+    seen_urls = set()
+
+    for i, line in enumerate(lines):
+        line_lower = line.lower()
+        if not any(t in line_lower for t in tokens):
+            continue
+        # Get context: a few lines around the match
+        start = max(0, i - 1)
+        end = min(len(lines), i + 3)
+        context = '\n'.join(lines[start:end])[:300]
+        # Use the matched line as title, context as snippet
+        title = line[:80]
+        if title not in seen_urls:
+            seen_urls.add(title)
+            results.append({"title": title, "url": url, "snippet": context})
+
+    return results[:n]
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Helpers
 # ═══════════════════════════════════════════════════════════════════
@@ -1055,21 +1119,28 @@ async def call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
                 except Exception:
                     pass
 
-            # Strategy 7: Generic search URL
+            # Strategy 7: Headless browser fallback
+            if not results and src and src.get("search_url") and not api and not src.get("sphinx_index") and not src.get("grep_url"):
+                try:
+                    results = await _search_headless(client, src, query, max_n)
+                except Exception:
+                    pass
+
+            # Strategy 8: Generic search URL
             if not results and src and src.get("search_url") and not api:
                 try:
                     results = await _search_generic(client, src, query, max_n)
                 except Exception:
                     pass
 
-            # Strategy 7b: Local grep fallback
+            # Strategy 9: Local grep fallback
             if not results and src and src.get("grep_url"):
                 try:
                     results = await _search_local_grep(client, src, query, max_n)
                 except Exception:
                     pass
 
-            # Strategy 8: Bing fallback (only for sources without dedicated backend)
+            # Strategy 10: Bing fallback (only for sources without dedicated backend)
             has_dedicated = bool(api) or (src and src.get("sphinx_index"))
             if not results and not has_dedicated:
                 try:
