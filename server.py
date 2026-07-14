@@ -89,9 +89,11 @@ SOURCES: dict[str, dict] = {
     },
     "ruby": {
         "name": "Ruby", "category": "programming_language",
-        "desc": "Ruby language docs",
+        "desc": "Ruby language docs (search_data.js index)",
         "sites": ["docs.ruby-lang.org", "ruby-doc.org"],
-        "search_url": "https://docs.ruby-lang.org/en/master/search/index.html?q={q}",
+        "api": "ruby",
+        "ruby_base": "https://docs.ruby-lang.org/ja/",
+        "ruby_index": "https://docs.ruby-lang.org/ja/search/js/search_data.js",
     },
     "swift": {
         "name": "Swift", "category": "programming_language",
@@ -266,7 +268,7 @@ SOURCES: dict[str, dict] = {
     # ── tool ───────────────────────────────────────────────────────
     "docker": {
         "name": "Docker", "category": "tool",
-        "desc": "Docker documentation",
+        "desc": "Docker documentation (Pagefind WASM, no HTTP API)",
         "sites": ["docs.docker.com"],
         "search_url": "https://docs.docker.com/search/?q={q}",
     },
@@ -486,6 +488,117 @@ def _get_sphinx(source: dict) -> SphinxIndex | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Ruby search_data.js engine
+# ═══════════════════════════════════════════════════════════════════
+
+class RubySearchIndex:
+    """Downloads, parses, caches, and searches Ruby's search_data.js."""
+
+    def __init__(self, index_url: str, base_url: str):
+        self.index_url = index_url
+        self.base_url = base_url.rstrip("/") + "/"
+        self._entries: list[dict] = []
+        self._loaded_at: float = 0
+
+    def _is_stale(self) -> bool:
+        return time.time() - self._loaded_at > CACHE_TTL
+
+    async def _ensure_loaded(self, client: httpx.AsyncClient) -> bool:
+        if self._entries and not self._is_stale():
+            return True
+        for attempt in range(2):
+            try:
+                resp = await client.get(
+                    self.index_url,
+                    headers={"User-Agent": UA},
+                    follow_redirects=True,
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                self._parse(resp.text)
+                self._loaded_at = time.time()
+                return True
+            except Exception:
+                if attempt == 0:
+                    await asyncio.sleep(1)
+        return bool(self._entries)
+
+    def _parse(self, js_text: str) -> None:
+        m = re.search(r"var search_data = (\{.*\});?\s*$", js_text, re.DOTALL)
+        if not m:
+            return
+        data = json.loads(m.group(1))
+        self._entries = data.get("index", [])
+
+    def search(self, query: str, max_results: int) -> list[dict]:
+        if not self._entries:
+            return []
+        query_lower = query.lower()
+        tokens = query_lower.split()
+        results: list[dict] = []
+        seen: set[str] = set()
+
+        scored: list[tuple[float, dict]] = []
+        for entry in self._entries:
+            name = (entry.get("name") or "").lower()
+            full_name = (entry.get("full_name") or "").lower()
+
+            score = 0.0
+            if query_lower == name:
+                score += 10.0
+            elif query_lower == full_name:
+                score += 8.0
+            elif query_lower in name and len(name) < len(query_lower) * 2:
+                score += 5.0
+            elif query_lower in full_name:
+                score += 3.0
+
+            for token in tokens:
+                if token == name:
+                    score += 4.0
+                elif token in name:
+                    score += 1.5
+                elif token in full_name:
+                    score += 1.0
+
+            if score > 0:
+                scored.append((score, entry))
+
+        scored.sort(key=lambda x: -x[0])
+
+        for _score, entry in scored:
+            if len(results) >= max_results:
+                break
+            full_name_val = entry.get("full_name") or entry.get("name") or ""
+            path = entry.get("path") or ""
+            key = f"{full_name_val}|{path}"
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({
+                "title": full_name_val,
+                "url": self.base_url + path,
+                "snippet": entry.get("type", ""),
+            })
+
+        return results
+
+
+_ruby_cache: dict[str, RubySearchIndex] = {}
+
+
+def _get_ruby(source: dict) -> RubySearchIndex | None:
+    """Get or create a cached RubySearchIndex for the given source."""
+    idx_url = source.get("ruby_index")
+    base_url = source.get("ruby_base")
+    if not idx_url or not base_url:
+        return None
+    if idx_url not in _ruby_cache:
+        _ruby_cache[idx_url] = RubySearchIndex(idx_url, base_url)
+    return _ruby_cache[idx_url]
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Search backends
 # ═══════════════════════════════════════════════════════════════════
 
@@ -696,6 +809,18 @@ async def _search_mslearn(
     return results
 
 
+async def _search_ruby(
+    client: httpx.AsyncClient, source: dict, query: str, n: int,
+) -> list[dict]:
+    """Search via Ruby's search_data.js index."""
+    idx = _get_ruby(source)
+    if not idx:
+        return []
+    ok = await idx._ensure_loaded(client)
+    if not ok:
+        return []
+    return idx.search(query, n)
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Helpers
@@ -853,21 +978,28 @@ async def call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
                 except Exception:
                     pass
 
-            # Strategy 5: Sphinx searchindex.js
+            # Strategy 5: Ruby search_data.js
+            if api == "ruby":
+                try:
+                    results = await _search_ruby(client, src, query, max_n)
+                except Exception:
+                    pass
+
+            # Strategy 6: Sphinx searchindex.js
             if not results and src and src.get("sphinx_index"):
                 try:
                     results = await _search_sphinx(client, src, query, max_n)
                 except Exception:
                     pass
 
-            # Strategy 6: Generic search URL
+            # Strategy 7: Generic search URL
             if not results and src and src.get("search_url") and not api:
                 try:
                     results = await _search_generic(client, src, query, max_n)
                 except Exception:
                     pass
 
-            # Strategy 7: Bing fallback (only for sources without dedicated backend)
+            # Strategy 8: Bing fallback (only for sources without dedicated backend)
             has_dedicated = bool(api) or (src and src.get("sphinx_index"))
             if not results and not has_dedicated:
                 try:
