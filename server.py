@@ -368,14 +368,17 @@ class SphinxIndex:
     async def _ensure_loaded(self, client: httpx.AsyncClient) -> bool:
         if self._terms and not self._is_stale():
             return True
-        try:
-            resp = await client.get(self.index_url, headers={"User-Agent": UA}, follow_redirects=True, timeout=30)
-            resp.raise_for_status()
-            self._parse(resp.text)
-            self._loaded_at = time.time()
-            return True
-        except Exception:
-            return bool(self._terms)
+        for attempt in range(2):
+            try:
+                resp = await client.get(self.index_url, headers={"User-Agent": UA}, follow_redirects=True, timeout=30)
+                resp.raise_for_status()
+                self._parse(resp.text)
+                self._loaded_at = time.time()
+                return True
+            except Exception:
+                if attempt == 0:
+                    await asyncio.sleep(1)
+        return bool(self._terms)
 
     def _parse(self, js_text: str) -> None:
         m = re.search(r"Search\.setIndex\((.*)\);?\s*$", js_text, re.DOTALL)
@@ -645,6 +648,7 @@ async def _search_algolia(
             "X-Algolia-Application-Id": app_id,
             "X-Algolia-API-Key": api_key,
         },
+        timeout=15,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -863,8 +867,9 @@ async def call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
                 except Exception:
                     pass
 
-            # Strategy 7: Bing fallback
-            if not results:
+            # Strategy 7: Bing fallback (only for sources without dedicated backend)
+            has_dedicated = bool(api) or (src and src.get("sphinx_index"))
+            if not results and not has_dedicated:
                 try:
                     sites = src["sites"] if src else []
                     results = await _search_bing(client, query, sites, max_n)
